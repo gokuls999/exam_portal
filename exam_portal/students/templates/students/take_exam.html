@@ -13,7 +13,7 @@
 <body>
     <div class="container mt-5">
         <h2>{{ exam.course }} - {{ exam.department }}</h2>
-        <div id="timer">Time Remaining: <span id="time">{{ time_limit }}</span> seconds</div>
+        <div id="timer" data-time-limit="{{ time_limit|safe }}">Time Remaining: <span id="time">{{ time_limit }}</span> seconds</div>
         {% if error %}
             <div class="alert alert-danger mt-3">{{ error }}</div>
         {% endif %}
@@ -48,14 +48,15 @@
                     </div>
                 </div>
             {% endfor %}
-            <button type="submit" class="btn btn-primary mt-3">Submit Exam</button>
+            <button type="submit" id="submitBtn" class="btn btn-primary mt-3">Submit Exam</button>
         </form>
     </div>
 
     <script>
-        let timeLeft = {{ time_limit }};
+        let timeLeft = parseInt(document.getElementById('timer').dataset.timeLimit);
         const timerElement = document.getElementById('time');
         const form = document.getElementById('examForm');
+        const submitBtn = document.getElementById('submitBtn');
         const video = document.getElementById('video');
         const canvas = document.getElementById('canvas');
         const ctx = canvas.getContext('2d');
@@ -72,6 +73,7 @@
             })
             .catch(err => {
                 alert('Webcam access denied. Exam requires face verification.');
+                submitBtn.disabled = true;
             });
 
         // Capture snapshot every 10 seconds
@@ -85,9 +87,16 @@
                     'X-CSRFToken': '{{ csrf_token }}'
                 },
                 body: JSON.stringify({ snapshot: snapshot })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'error') {
+                    alert('Face verification failed: ' + data.message);
+                    submitBtn.disabled = true;
+                }
             });
         }
-        setInterval(captureSnapshot, 10000);  // Every 10 seconds
+        setInterval(captureSnapshot, 10000);
 
         // Timer
         const timer = setInterval(() => {

@@ -400,13 +400,21 @@ def take_exam(request, exam_id):
     except Exam.DoesNotExist:
         return redirect('student_exam_list')
 
-    # Check if already submitted
     if StudentExamSubmission.objects.filter(student=student, exam=exam).exists():
         return redirect('exam_result', exam_id=exam_id)
 
     questions = Question.objects.filter(exam=exam)
 
     if request.method == 'POST':
+        if request.session.get(f'exam_{exam_id}_face_mismatch'):
+            return render(request, 'students/take_exam.html', {
+                'student': student,
+                'exam': exam,
+                'questions': questions,
+                'time_limit': exam.time_limit * 60,
+                'error': 'Face verification failed during exam. Submission denied.'
+            })
+
         answers = {}
         for question in questions:
             answer = request.POST.get(f'question_{question.id}')
@@ -420,10 +428,14 @@ def take_exam(request, exam_id):
             elif submitted_answer:
                 score -= question.marks_wrong
 
-        # Save submission
         StudentExamSubmission.objects.create(student=student, exam=exam, score=score)
+        del request.session[f'exam_{exam_id}_snapshots']
+        if f'exam_{exam_id}_face_mismatch' in request.session:
+            del request.session[f'exam_{exam_id}_face_mismatch']
         return redirect('exam_result', exam_id=exam_id)
 
+    request.session[f'exam_{exam_id}_snapshots'] = []
+    request.session[f'exam_{exam_id}_face_mismatch'] = False
     return render(request, 'students/take_exam.html', {
         'student': student,
         'exam': exam,
@@ -451,12 +463,76 @@ def exam_result(request, exam_id):
 
 @csrf_exempt
 def save_snapshot(request, exam_id):
-    if request.method == 'POST' and request.session.get('student_id'):
-        data = json.loads(request.body)
-        snapshot = data.get('snapshot')
-        if snapshot:
-            snapshots = request.session.get(f'exam_{exam_id}_snapshots', [])
-            snapshots.append(snapshot)
-            request.session[f'exam_{exam_id}_snapshots'] = snapshots
-            return JsonResponse({'status': 'success'})
-    return JsonResponse({'status': 'error'}, status=400)
+    if request.method != 'POST' or 'student_id' not in request.session:
+        return JsonResponse({'status': 'error'}, status=400)
+
+    student = Student.objects.get(id=request.session['student_id'])
+    data = json.loads(request.body)
+    snapshot = data.get('snapshot')
+    if not snapshot:
+        return JsonResponse({'status': 'error', 'message': 'No snapshot provided'}, status=400)
+
+    # Decode snapshot
+    format, imgstr = snapshot.split(';base64,')
+    data = base64.b64decode(imgstr)
+    snapshot_image = Image.open(BytesIO(data))
+    snapshot_np = np.array(snapshot_image)
+    snapshot_encodings = face_recognition.face_encodings(snapshot_np)
+
+    if not snapshot_encodings:
+        request.session[f'exam_{exam_id}_face_mismatch'] = True
+        return JsonResponse({'status': 'error', 'message': 'No face detected'})
+
+    snapshot_encoding = snapshot_encodings[0]
+
+    # Load student’s registered photos
+    stored_images = [
+        face_recognition.load_image_file(student.photo1.path),
+        face_recognition.load_image_file(student.photo2.path),
+        face_recognition.load_image_file(student.photo3.path),
+    ]
+    stored_encodings = []
+    for img in stored_images:
+        encodings = face_recognition.face_encodings(img)
+        if encodings:
+            stored_encodings.append(encodings[0])
+
+    if not stored_encodings:
+        return JsonResponse({'status': 'error', 'message': 'No valid face data in profile'}, status=500)
+
+    # Check against student’s photos
+    matches = face_recognition.compare_faces(stored_encodings, snapshot_encoding, tolerance=0.45)
+    if not any(matches):
+        request.session[f'exam_{exam_id}_face_mismatch'] = True
+        return JsonResponse({'status': 'error', 'message': 'Face does not match registered photos'})
+
+    # Cross-check against other users
+    all_teachers = Teacher.objects.all()
+    all_students = Student.objects.exclude(id=student.id)
+    other_encodings = []
+    for other_student in all_students:
+        for photo_field in [other_student.photo1, other_student.photo2, other_student.photo3]:
+            if photo_field:
+                img = face_recognition.load_image_file(photo_field.path)
+                encodings = face_recognition.face_encodings(img)
+                if encodings:
+                    other_encodings.append((other_student.register_no, encodings[0]))
+    for teacher in all_teachers:
+        for photo_field in [teacher.photo1, teacher.photo2, teacher.photo3]:
+            if photo_field:
+                img = face_recognition.load_image_file(photo_field.path)
+                encodings = face_recognition.face_encodings(img)
+                if encodings:
+                    other_encodings.append((teacher.teacher_id, encodings[0]))
+
+    if other_encodings:
+        other_matches = face_recognition.compare_faces([enc for _, enc in other_encodings], snapshot_encoding, tolerance=0.45)
+        if any(other_matches):
+            matched_users = [user_id for (user_id, _), match in zip(other_encodings, other_matches) if match]
+            request.session[f'exam_{exam_id}_face_mismatch'] = True
+            return JsonResponse({'status': 'error', 'message': f'Face matches another user: {", ".join(matched_users)}'})
+
+    snapshots = request.session.get(f'exam_{exam_id}_snapshots', [])
+    snapshots.append(snapshot)
+    request.session[f'exam_{exam_id}_snapshots'] = snapshots
+    return JsonResponse({'status': 'success'})
